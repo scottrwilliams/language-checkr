@@ -1,4 +1,4 @@
-service: versioncheckr
+service: languagecheckr
 
 provider:
   name: aws
@@ -20,7 +20,7 @@ package:
   exclude:
     - ".editorconfig"
     - ".eslintignore"
-    - ".eslintrc"
+    - ".eslintrc.yml"
     - "LICENSE"
     - "README.md"
     - ".nyc_output/**"
@@ -28,8 +28,8 @@ package:
     - "test/**"
 
 functions:
-  versioncheckr:
-    handler: versioncheckr.handler
+  languagecheckr:
+    handler: languagecheckr.handler
     memory: 128
     environment:
       PEM_BUCKET_NAME:
@@ -40,11 +40,11 @@ functions:
     events:
       - http:
           method: post
-          path: versioncheckr
+          path: languagecheckr
 
 resources:
   Resources:
     configBucket:
       Type: AWS::S3::Bucket
       Properties:
-        BucketName: versioncheckr-cfg
+        BucketName: languagecheckr-cfg
