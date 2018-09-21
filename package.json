@@ -1,6 +1,6 @@
 {
   "name": "languagecheckr",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "GitHub App to check if translations are valid",
   "main": "languagecheckr.js",
   "scripts": {
@@ -12,9 +12,10 @@
   "author": "Scott Williams",
   "license": "MIT",
   "dependencies": {
-    "aws-sdk": "^2.311.0",
     "@octokit/rest": "^15.11.1",
+    "aws-sdk": "^2.311.0",
     "jsonwebtoken": "^8.3.0",
+    "messageformat-validator": "github:bearfriend/messageformat-validator",
     "sinon": "^6.2.0"
   },
   "devDependencies": {
