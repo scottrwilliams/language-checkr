@@ -7,6 +7,9 @@ const GitHubApi = require('@octokit/rest'),
   path = require('path'),
   langValidator = require('messageformat-validator');
 
+const SOURCE_LOCAL = 'en';
+const FOLDER = 'locale/';
+
 function validateSignature(body, xHubSignature) {
   const hmac = crypto.createHmac('sha1', process.env.WEBHOOK_SECRET);
   const bodySig = `sha1=${hmac.update(body).digest('hex')}`;
@@ -49,7 +52,7 @@ async function gitHubAuthenticate(appId, cert, installationId) {
   return github;
 }
 
-async function getLanguageFiles(github, owner, repo, headSha, pullRequestNumber) {
+async function getLanguageFiles(github, owner, repo, headSha, baseRef, pullRequestNumber, checkRunName) {
 
   const allFiles = await github.pullRequests.getFiles({
     owner,
@@ -57,35 +60,54 @@ async function getLanguageFiles(github, owner, repo, headSha, pullRequestNumber)
     number: pullRequestNumber
   });
 
-  const languageFiles = allFiles.data.filter(file =>
-    file.status !== 'removed' &&
-    file.filename.startsWith('locale/') &&
-    file.filename.endsWith('.json')
-  );
+  let languageFiles;
+  if (checkRunName) {
+    //only check single file in a check_run
+    languageFiles = [{
+      filename: path.join(FOLDER, checkRunName)
+    }];
+  } else {
+    languageFiles = allFiles.data.filter(file =>
+      file.status !== 'removed' &&
+      file.filename.startsWith(FOLDER) &&
+      file.filename.endsWith('.json')
+    );
+  }
 
+  //grab local source file if it isn't part of the pull request
+  if (languageFiles.length > 0 &&
+    !languageFiles.some(file => path.basename(file.filename, '.json') === SOURCE_LOCAL)) {
+    languageFiles.push({
+      filename: path.join(FOLDER, SOURCE_LOCAL + '.json'),
+      autoAddedSource: true
+    });
+  }
+
+  //TODO: fail when can't find source file
   return Promise.all(languageFiles.map(async file => {
     const fileContents = await github.repos.getContent({
       owner,
       repo,
-      ref: headSha,
+      ref: file.autoAddedSource ? baseRef : headSha,
       path: file.filename
     });
     return {
       filePath: file.filename,
       fileName: path.basename(file.filename, '.json'),
-      fileText: Buffer.from(fileContents.data.content, 'base64').toString()
+      fileText: Buffer.from(fileContents.data.content, 'base64').toString(),
+      autoAddedSource: !!file.autoAddedSource
     };
   }));
 }
 
-async function updateCheck(github, owner, repo, sha, languageFiles) {
+async function updateCheck(github, owner, repo, headSha, languageFiles) {
 
   if (languageFiles.length == 0) {
     return github.checks.create({
       owner,
       repo,
       name: 'Language Checker',
-      head_sha: sha,
+      head_sha: headSha,
       status: 'completed',
       conclusion: 'neutral',
       completed_at: new Date().toISOString(),
@@ -98,49 +120,50 @@ async function updateCheck(github, owner, repo, sha, languageFiles) {
 
   const fileLookup = new Map();
   languageFiles.forEach(file => {
-    fileLookup.set(file.fileName, file.filePath);
+    fileLookup.set(file.fileName, {
+      filePath: file.filePath,
+      autoAddedSource: file.autoAddedSource
+    });
   });
 
-  const locales = languageFiles.reduce(
-    (obj, file) => {
-      obj[file.fileName] = file.fileText;
-      return obj;
-    }, {}
-  );
+  const input = {
+    locales: languageFiles.reduce(
+      (obj, file) => {
+        obj[file.fileName] = file.fileText;
+        return obj;
+      }, {}
+    ),
+    sourceLocale: SOURCE_LOCAL
+  };
 
-  console.log(JSON.stringify({
-    locales,
-    sourceLocale: 'en'
-  }));
+  const output = langValidator.validateLocales(input);
 
-  const output = langValidator.validateLocales({
-    locales,
-    sourceLocale: 'en'
-  });
-
-  console.log(JSON.stringify(output));
-
-  //TODO: always ensure english file sent
-  //TODO: handle English failure
-
+  //TODO: optional configuration for path and ignore warnings
   return Promise.all(output.map(locale => {
 
-    //TODO: markdown output
-
     if (!locale.parsed) {
+      let summary = `There was an error while parsing the file: \`${locale._error.message}\``;
+      if (locale.locale === SOURCE_LOCAL) {
+        summary += '\n\n**NOTE: Since this is the source translation file, no other translations could be processed for errors.**';
+      }
       return github.checks.create({
         owner,
         repo,
         name: `File: ${locale.locale}.json`,
-        head_sha: sha,
+        head_sha: headSha,
         status: 'completed',
         conclusion: 'failure',
         completed_at: new Date().toISOString(),
         output: {
           title: 'The translation file is not valid',
-          summary: JSON.stringify(locale._error) //TODO: add extra msg if locale is source locale
+          summary
         }
       });
+    }
+
+    //don't add check for source file if it was auto-added
+    if (fileLookup.get(locale.locale).autoAddedSource) {
+      return;
     }
 
     const errors = locale.report.totals.errors;
@@ -151,7 +174,7 @@ async function updateCheck(github, owner, repo, sha, languageFiles) {
         owner,
         repo,
         name: `File: ${locale.locale}.json`,
-        head_sha: sha,
+        head_sha: headSha,
         status: 'completed',
         conclusion: 'success',
         completed_at: new Date().toISOString(),
@@ -162,28 +185,59 @@ async function updateCheck(github, owner, repo, sha, languageFiles) {
       });
     }
 
-    //cap annotations at 50
-    //TODO: also display a message if issues were capped
-    locale.issues.length = Math.min(locale.issues.length, 50);
+    //cap issues at 100 so raw output isn't larger than GitHub size limit for summary
+    let limitOutput = false;
+    if (locale.issues.length > 100) {
+      locale.issues.length = 100;
+      limitOutput = true;
+    }
+
+    const rawOutput = locale.issues.reduce(
+      (output, issue) => output +
+      `${issue.type} ${issue.level}\n` +
+      `  Message: ${issue.msg}\n` +
+      `  File: ${issue.locale}.json\n` +
+      `  Line: ${issue.line}:${issue.column}\n` +
+      `  Key: ${issue.key}\n` +
+      `  Target: ${issue.target ? issue.target.replace(/\n/g, "\\n") : ''}\n` +
+      `  Source: ${issue.source.replace(/\n/g, "\\n")}\n\n`, ""
+    );
+
+    let summary = '**There are issues with the translations!**\n\n```\n' +
+      JSON.stringify(locale.report, null, 2) +
+      '\n```\n<details><summary>Show Raw Output</summary>\n\n```\n' +
+      rawOutput +
+      '```\n</details>';
+
+    //cap annotations at 50 for GitHub limits
+    if (locale.issues.length > 50) {
+      locale.issues.length = 50;
+      summary += '<br>\n\n';
+      if (limitOutput) {
+        summary += '**NOTE: Only showing the first 100 issues in output above**\n';
+      }
+      summary += '**NOTE: Only showing the first 50 annotations below**';
+    }
 
     return github.checks.create({
       owner,
       repo,
       name: `File: ${locale.locale}.json`,
-      head_sha: sha,
+      head_sha: headSha,
       status: 'completed',
       conclusion: errors === 0 ? 'neutral' : 'failure',
       completed_at: new Date().toISOString(),
       output: {
         title: `Found ${errors} error(s), ${warnings} warning(s)`,
-        summary: JSON.stringify(locale),
+        summary: summary,
         annotations: locale.issues.map(issue => ({
-          path: fileLookup.get(locale.locale),
-          start_line: issue.line, //TODO: column?
+          path: fileLookup.get(locale.locale).filePath,
+          start_line: issue.line, //TODO: include column?
           end_line: issue.line,
-          annotation_level: issue.level,
+          annotation_level: issue.level === 'error' ? 'failure' : issue.level,
           title: `${issue.type} ${issue.level}`,
-          message: `"${issue.key}": ${issue.msg}`
+          message: issue.msg,
+          raw_details: `Key: ${issue.key}\nSource: ${issue.source.replace(/\n/g, "\\n")}`
         }))
       }
     });
@@ -216,15 +270,26 @@ module.exports.handler = async (event, context, callback) => {
   }
 
   const webHook = JSON.parse(event.body);
-  let pullRequestNumber, headSha;
+  let pullRequestNumber, headSha, baseRef, checkRunName;
   if (githubEvent === 'check_suite' &&
     (webHook.action === 'requested' || webHook.action === 'rerequested')) {
-    pullRequestNumber = webHook.check_suite.pull_requests[0].number;
-    headSha = webHook.check_suite.pull_requests[0].head.sha;
+    if (webHook.check_suite.pull_requests.length > 0) {
+      pullRequestNumber = webHook.check_suite.pull_requests[0].number;
+      headSha = webHook.check_suite.pull_requests[0].head.sha;
+      baseRef = webHook.check_suite.pull_requests[0].base.ref;
+    } else {
+      //wait until webhook notifies pull request is opened
+      return callback(null, createResponse(202, 'Request did not conatin PR info'));
+    }
   } else if (githubEvent === 'check_run' && webHook.action === 'rerequested') {
-    //TODO: only check single file in check_run
+    checkRunName = webHook.check_run.name.replace('File: ', '');
     pullRequestNumber = webHook.check_run.check_suite.pull_requests[0].number;
     headSha = webHook.check_run.check_suite.pull_requests[0].head.sha;
+    baseRef = webHook.check_run.check_suite.pull_requests[0].base.ref;
+  } else if (githubEvent === 'pull_request' && webHook.action === 'opened') {
+    pullRequestNumber = webHook.pull_request.number;
+    baseRef = webHook.pull_request.base.ref;
+    headSha = webHook.pull_request.head.sha;
   } else {
     return callback(null, createResponse(202, 'No action to take'));
   }
@@ -235,7 +300,7 @@ module.exports.handler = async (event, context, callback) => {
 
   try {
     const github = await gitHubAuthenticate(process.env.APP_ID, await privateKey, installationId);
-    const languageFiles = await getLanguageFiles(github, owner, repo, headSha, pullRequestNumber);
+    const languageFiles = await getLanguageFiles(github, owner, repo, headSha, baseRef, pullRequestNumber, checkRunName);
     const checks = await updateCheck(github, owner, repo, headSha, languageFiles);
     if (Array.isArray(checks)) {
       return callback(null, createResponse(200, `Checked ${checks.length} files`));

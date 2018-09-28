@@ -30,7 +30,7 @@ package:
 functions:
   languagecheckr:
     handler: languagecheckr.handler
-    memory: 128
+    memorySize: 1536
     environment:
       PEM_BUCKET_NAME:
         Ref: "configBucket"

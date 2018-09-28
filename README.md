@@ -12,7 +12,7 @@ Creates a serverless endpoint for a GitHub App to check if translations are vali
 * Set `Repository contents` permission to `Read-only`
 * Set `Pull requests` permission to `Read-only`
 * Every other permission should be set to `No access`
-* No webhooks need to be selected under `Subscribe to events`. GitHub will automatically send `check_suite` and `check_run` events
+* Select only `Pull request` under `Subscribe to events`
 6. Save app and make note of the App Id
 7. [Generate a private key](https://developer.github.com/apps/building-integrations/setting-up-and-registering-github-apps/registering-github-apps/#generating-a-private-key) for the App and save it
 8. Ensure serverless is [configured with appropriate AWS credentials](https://serverless.com/framework/docs/providers/aws/guide/quick-start/)
