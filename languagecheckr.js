@@ -8,7 +8,6 @@ const GitHubApi = require('@octokit/rest'),
   langValidator = require('messageformat-validator');
 
 const SOURCE_LOCAL = 'en';
-const FOLDER = 'locale/';
 
 function validateSignature(body, xHubSignature) {
   const hmac = crypto.createHmac('sha1', process.env.WEBHOOK_SECRET);
@@ -52,24 +51,62 @@ async function gitHubAuthenticate(appId, cert, installationId) {
   return github;
 }
 
-async function getLanguageFiles(github, owner, repo, headSha, baseRef, pullRequestNumber, checkRunName) {
-
-  const allFiles = await github.pullRequests.getFiles({
+async function getSourceDir(github, owner, repo, headSha) {
+  const files = await github.repos.getContent({
     owner,
     repo,
-    number: pullRequestNumber
+    ref: headSha,
+    path: ''
   });
+  const sergeFile = files.data.filter(file =>
+    file.type === 'file' &&
+    file.path.endsWith('.serge.json')
+  );
+  let sourceDir;
+  if (sergeFile.length === 1) {
+    const sergeContents = await github.repos.getContent({
+      owner,
+      repo,
+      ref: headSha,
+      path: sergeFile[0].path
+    })
+    sourceDir = JSON.parse(Buffer.from(sergeContents.data.content, 'base64')).source_dir;
+  }
+  return sourceDir;
+}
+
+async function getLanguageFiles(github, owner, repo, headSha, sourceDir, pullRequestNumber, checkRunName) {
+  if (!sourceDir) {
+    return;
+  }
 
   let languageFiles;
   if (checkRunName) {
     //only check single file in a check_run
     languageFiles = [{
-      filename: path.join(FOLDER, checkRunName)
+      filename: path.join(sourceDir, checkRunName)
     }];
   } else {
-    languageFiles = allFiles.data.filter(file =>
+    let allFiles;
+    if (pullRequestNumber) {
+      const getFiles = await github.pullRequests.getFiles({
+        owner,
+        repo,
+        number: pullRequestNumber,
+        per_page: 100
+      });
+      allFiles = getFiles.data;
+    } else {
+      const getCommit = await github.repos.getCommit({
+        owner,
+        repo,
+        sha: headSha
+      });
+      allFiles = getCommit.data.files;
+    }
+    languageFiles = allFiles.filter(file =>
       file.status !== 'removed' &&
-      file.filename.startsWith(FOLDER) &&
+      file.filename.startsWith(sourceDir) &&
       file.filename.endsWith('.json')
     );
   }
@@ -78,17 +115,16 @@ async function getLanguageFiles(github, owner, repo, headSha, baseRef, pullReque
   if (languageFiles.length > 0 &&
     !languageFiles.some(file => path.basename(file.filename, '.json') === SOURCE_LOCAL)) {
     languageFiles.push({
-      filename: path.join(FOLDER, SOURCE_LOCAL + '.json'),
+      filename: path.join(sourceDir, SOURCE_LOCAL + '.json'),
       autoAddedSource: true
     });
   }
 
-  //TODO: fail when can't find source file
   return Promise.all(languageFiles.map(async file => {
     const fileContents = await github.repos.getContent({
       owner,
       repo,
-      ref: file.autoAddedSource ? baseRef : headSha,
+      ref: headSha,
       path: file.filename
     });
     return {
@@ -100,20 +136,30 @@ async function getLanguageFiles(github, owner, repo, headSha, baseRef, pullReque
   }));
 }
 
-async function updateCheck(github, owner, repo, headSha, languageFiles) {
+async function updateCheck(github, owner, repo, headSha, sourceDir, languageFiles) {
 
-  if (languageFiles.length == 0) {
+  if (!sourceDir || languageFiles.length == 0) {
+    let title, summary, conclusion;
+    if (!sourceDir) {
+      title = 'Did not find the necessary config file';
+      summary = 'Could not find a .serge.json file that defines the `source_dir` folder where translations are stored';
+      conclusion = 'cancelled';
+    } else {
+      title = 'Did not find any translations';
+      summary = `No translation files found as part of the commit within the directory \`${sourceDir}\``;
+      conclusion = 'neutral';
+    }
     return github.checks.create({
       owner,
       repo,
       name: 'Language Checker',
       head_sha: headSha,
       status: 'completed',
-      conclusion: 'neutral',
+      conclusion,
       completed_at: new Date().toISOString(),
       output: {
-        title: 'Language files',
-        summary: 'Did not find any translations'
+        title,
+        summary
       }
     });
   }
@@ -138,7 +184,6 @@ async function updateCheck(github, owner, repo, headSha, languageFiles) {
 
   const output = langValidator.validateLocales(input);
 
-  //TODO: optional configuration for path and ignore warnings
   return Promise.all(output.map(locale => {
 
     if (!locale.parsed) {
@@ -199,8 +244,8 @@ async function updateCheck(github, owner, repo, headSha, languageFiles) {
       `  File: ${issue.locale}.json\n` +
       `  Line: ${issue.line}:${issue.column}\n` +
       `  Key: ${issue.key}\n` +
-      `  Target: ${issue.target ? issue.target.replace(/\n/g, "\\n") : ''}\n` +
-      `  Source: ${issue.source.replace(/\n/g, "\\n")}\n\n`, ""
+      `  Target: ${issue.target}\n` +
+      `  Source: ${issue.source}\n\n`, ""
     );
 
     let summary = '**There are issues with the translations!**\n\n```\n' +
@@ -232,12 +277,12 @@ async function updateCheck(github, owner, repo, headSha, languageFiles) {
         summary: summary,
         annotations: locale.issues.map(issue => ({
           path: fileLookup.get(locale.locale).filePath,
-          start_line: issue.line, //TODO: include column?
+          start_line: issue.line,
           end_line: issue.line,
           annotation_level: issue.level === 'error' ? 'failure' : issue.level,
           title: `${issue.type} ${issue.level}`,
           message: issue.msg,
-          raw_details: `Key: ${issue.key}\nSource: ${issue.source.replace(/\n/g, "\\n")}`
+          raw_details: `Key: ${issue.key}\nSource: ${issue.source}`
         }))
       }
     });
@@ -270,26 +315,23 @@ module.exports.handler = async (event, context, callback) => {
   }
 
   const webHook = JSON.parse(event.body);
-  let pullRequestNumber, headSha, baseRef, checkRunName;
+  let headSha, pullRequestNumber, checkRunName;
   if (githubEvent === 'check_suite' &&
     (webHook.action === 'requested' || webHook.action === 'rerequested')) {
-    if (webHook.check_suite.pull_requests.length > 0) {
+    headSha = webHook.check_suite.head_sha;
+    if (webHook.check_suite.pull_requests.length > 0 &&
+      webHook.check_suite.pull_requests[0].head.sha === headSha) {
+      //need to list all files in PR if latest commit is part of an open PR
       pullRequestNumber = webHook.check_suite.pull_requests[0].number;
-      headSha = webHook.check_suite.pull_requests[0].head.sha;
-      baseRef = webHook.check_suite.pull_requests[0].base.ref;
-    } else {
-      //wait until webhook notifies pull request is opened
-      return callback(null, createResponse(202, 'Request did not conatin PR info'));
     }
   } else if (githubEvent === 'check_run' && webHook.action === 'rerequested') {
+    headSha = webHook.check_run.head_sha;
     checkRunName = webHook.check_run.name.replace('File: ', '');
-    pullRequestNumber = webHook.check_run.check_suite.pull_requests[0].number;
-    headSha = webHook.check_run.check_suite.pull_requests[0].head.sha;
-    baseRef = webHook.check_run.check_suite.pull_requests[0].base.ref;
-  } else if (githubEvent === 'pull_request' && webHook.action === 'opened') {
-    pullRequestNumber = webHook.pull_request.number;
-    baseRef = webHook.pull_request.base.ref;
+  } else if (githubEvent === 'pull_request' &&
+    (webHook.action === 'opened' || webHook.action === 'reopened')) {
+    //update checks to include all files in new PR
     headSha = webHook.pull_request.head.sha;
+    pullRequestNumber = webHook.pull_request.number;
   } else {
     return callback(null, createResponse(202, 'No action to take'));
   }
@@ -300,8 +342,9 @@ module.exports.handler = async (event, context, callback) => {
 
   try {
     const github = await gitHubAuthenticate(process.env.APP_ID, await privateKey, installationId);
-    const languageFiles = await getLanguageFiles(github, owner, repo, headSha, baseRef, pullRequestNumber, checkRunName);
-    const checks = await updateCheck(github, owner, repo, headSha, languageFiles);
+    const sourceDir = await getSourceDir(github, owner, repo, headSha);
+    const languageFiles = await getLanguageFiles(github, owner, repo, headSha, sourceDir, pullRequestNumber, checkRunName);
+    const checks = await updateCheck(github, owner, repo, headSha, sourceDir, languageFiles);
     if (Array.isArray(checks)) {
       return callback(null, createResponse(200, `Checked ${checks.length} files`));
     } else {
