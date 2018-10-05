@@ -138,7 +138,7 @@ async function getLanguageFiles(github, owner, repo, headSha, sourceDir, pullReq
 
 async function updateCheck(github, owner, repo, headSha, sourceDir, languageFiles) {
 
-  if (!sourceDir || languageFiles.length == 0) {
+  if (!sourceDir || languageFiles.length === 0) {
     let title, summary, conclusion;
     if (!sourceDir) {
       title = 'Did not find the necessary config file';
@@ -183,10 +183,12 @@ async function updateCheck(github, owner, repo, headSha, sourceDir, languageFile
   };
 
   const output = langValidator.validateLocales(input);
+  let allChecksPassed = true;
 
-  return Promise.all(output.map(locale => {
+  const allFileChecks = await Promise.all(output.map(locale => {
 
     if (!locale.parsed) {
+      allChecksPassed = false;
       let summary = `There was an error while parsing the file: \`${locale._error.message}\``;
       if (locale.locale === SOURCE_LOCAL) {
         summary += '\n\n**NOTE: Since this is the source translation file, no other translations could be processed for errors.**';
@@ -214,7 +216,7 @@ async function updateCheck(github, owner, repo, headSha, sourceDir, languageFile
     const errors = locale.report.totals.errors;
     const warnings = locale.report.totals.warnings;
 
-    if (errors === 0 && warnings == 0) {
+    if (errors === 0 && warnings === 0) {
       return github.checks.create({
         owner,
         repo,
@@ -264,6 +266,10 @@ async function updateCheck(github, owner, repo, headSha, sourceDir, languageFile
       summary += '**NOTE: Only showing the first 50 annotations below**';
     }
 
+    if (errors > 0) {
+      allChecksPassed = false;
+    }
+
     return github.checks.create({
       owner,
       repo,
@@ -287,6 +293,22 @@ async function updateCheck(github, owner, repo, headSha, sourceDir, languageFile
       }
     });
   }));
+
+  await github.checks.create({
+    owner,
+    repo,
+    name: 'Language Checker',
+    head_sha: headSha,
+    status: 'completed',
+    conclusion: allChecksPassed ? 'success' : 'failure',
+    completed_at: new Date().toISOString(),
+    output: {
+      title: allChecksPassed ? 'No errors with the translation files' : 'Found at least 1 problem with a translation file',
+      summary: allChecksPassed ? 'Yay!' : 'Please see individual checks for more details'
+    }
+  });
+
+  return allFileChecks;
 }
 
 function createResponse(statusCode, msg) {
@@ -326,7 +348,15 @@ module.exports.handler = async (event, context, callback) => {
     }
   } else if (githubEvent === 'check_run' && webHook.action === 'rerequested') {
     headSha = webHook.check_run.head_sha;
-    checkRunName = webHook.check_run.name.replace('File: ', '');
+    if (webHook.check_run.name === 'Language Checker') {
+      //if check run gets re-run not on a specific language file, run all checks again
+      if (webHook.check_run.check_suite.pull_requests.length > 0 &&
+        webHook.check_run.check_suite.pull_requests[0].head.sha === headSha) {
+        pullRequestNumber = webHook.check_run.check_suite.pull_requests[0].number;
+      }
+    } else {
+      checkRunName = webHook.check_run.name.replace('File: ', '');
+    }
   } else if (githubEvent === 'pull_request' &&
     (webHook.action === 'opened' || webHook.action === 'reopened')) {
     //update checks to include all files in new PR
