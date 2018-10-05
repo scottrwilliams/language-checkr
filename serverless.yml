@@ -1,4 +1,4 @@
-service: languagecheckr-test
+service: languagecheckr
 
 provider:
   name: aws
@@ -47,4 +47,4 @@ resources:
     configBucket:
       Type: AWS::S3::Bucket
       Properties:
-        BucketName: languagecheckr-cfg-test
+        BucketName: languagecheckr-cfg
