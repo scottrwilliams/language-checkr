@@ -1,6 +1,6 @@
 {
   "name": "languagecheckr",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "GitHub App to check if translations are valid",
   "license": "MIT",
   "author": "Scott Williams",
@@ -10,12 +10,12 @@
     "lint": "eslint ."
   },
   "dependencies": {
-    "@octokit/rest": "^15.12.1",
-    "aws-sdk": "^2.326.0",
+    "@octokit/rest": "^15.15.1",
+    "aws-sdk": "^2.344.0",
     "jsonwebtoken": "^8.3.0",
     "messageformat-validator": "0.0.22"
   },
   "devDependencies": {
-    "eslint": "^5.6.1"
+    "eslint": "^5.8.0"
   }
 }

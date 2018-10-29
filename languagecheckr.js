@@ -337,16 +337,31 @@ module.exports.handler = async (event, context, callback) => {
   }
 
   const webHook = JSON.parse(event.body);
+  if (!((githubEvent === 'check_suite' && (webHook.action === 'requested' || webHook.action === 'rerequested')) ||
+      (githubEvent === 'check_run' && webHook.action === 'rerequested') ||
+      (githubEvent === 'pull_request' && (webHook.action === 'opened' || webHook.action === 'reopened')))) {
+    return callback(null, createResponse(202, 'No action to take'));
+  }
+
+  const installationId = webHook.installation.id;
+  const owner = webHook.repository.owner.login;
+  const repo = webHook.repository.name;
+  let github;
+  try {
+    github = await gitHubAuthenticate(process.env.APP_ID, await privateKey, installationId);
+  } catch (e) {
+    return callback(e);
+  }
+
   let headSha, pullRequestNumber, checkRunName;
-  if (githubEvent === 'check_suite' &&
-    (webHook.action === 'requested' || webHook.action === 'rerequested')) {
+  if (githubEvent === 'check_suite') {
     headSha = webHook.check_suite.head_sha;
     if (webHook.check_suite.pull_requests.length > 0 &&
       webHook.check_suite.pull_requests[0].head.sha === headSha) {
       //need to list all files in PR if latest commit is part of an open PR
       pullRequestNumber = webHook.check_suite.pull_requests[0].number;
     }
-  } else if (githubEvent === 'check_run' && webHook.action === 'rerequested') {
+  } else if (githubEvent === 'check_run') {
     headSha = webHook.check_run.head_sha;
     if (webHook.check_run.name === 'Language Checker') {
       //if check run gets re-run not on a specific language file, run all checks again
@@ -357,21 +372,23 @@ module.exports.handler = async (event, context, callback) => {
     } else {
       checkRunName = webHook.check_run.name.replace('File: ', '');
     }
-  } else if (githubEvent === 'pull_request' &&
-    (webHook.action === 'opened' || webHook.action === 'reopened')) {
+  } else if (githubEvent === 'pull_request') {
     //update checks to include all files in new PR
     headSha = webHook.pull_request.head.sha;
     pullRequestNumber = webHook.pull_request.number;
-  } else {
-    return callback(null, createResponse(202, 'No action to take'));
+    //check if commit was flagged with "skip-checks: true"
+    const checks = github.checks.listSuitesForRef({
+      owner,
+      repo,
+      ref: headSha,
+      app_id: process.env.APP_ID
+    });
+    if (!checks.data.total_count) {
+      return callback(null, createResponse(202, 'Checks have been flagged to skip'));
+    }
   }
 
-  const installationId = webHook.installation.id;
-  const owner = webHook.repository.owner.login;
-  const repo = webHook.repository.name;
-
   try {
-    const github = await gitHubAuthenticate(process.env.APP_ID, await privateKey, installationId);
     const sourceDir = await getSourceDir(github, owner, repo, headSha);
     const languageFiles = await getLanguageFiles(github, owner, repo, headSha, sourceDir, pullRequestNumber, checkRunName);
     const checks = await updateCheck(github, owner, repo, headSha, sourceDir, languageFiles);
